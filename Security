@@ -1,0 +1,340 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <curl/curl.h>
+#include <time.h>
+#include <sys/time.h>
+#include <signal.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+typedef struct {
+    long total_requests;
+    long successful_requests;
+    long failed_requests;
+    long timeout_requests;
+    double total_response_time;
+    double min_response_time;
+    double max_response_time;
+    int http_codes[600];
+} test_stats_t;
+
+typedef struct {
+    char *url;
+    int thread_id;
+    int requests_per_second;
+    int duration;
+    int connection_timeout;
+    test_stats_t *stats;
+    pthread_mutex_t *stats_mutex;
+    int *running;
+} thread_data_t;
+
+typedef struct {
+    char *data;
+    size_t size;
+} response_data_t;
+
+static volatile int keep_running = 1;
+static test_stats_t global_stats = {0};
+static pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void signal_handler(int sig) {
+    keep_running = 0;
+    printf("\n[!] Got stop signal, summarizing results...\n");
+}
+
+size_t write_callback(void *contents, size_t size, size_t nmemb, response_data_t *response) {
+    size_t realsize = size * nmemb;
+    response->data = realloc(response->data, response->size + realsize + 1);
+    if (response->data == NULL) {
+        return 0;
+    }
+    memcpy(&(response->data[response->size]), contents, realsize);
+    response->size += realsize;
+    response->data[response->size] = '\0';
+    return realsize;
+}
+
+double get_time_diff(struct timeval start, struct timeval end) {
+    return (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0;
+}
+
+void check_vulnerabilities(const char *response_data, const char *url) {
+    if (response_data == NULL) return;
+    
+    printf("\n[VULNERABILITY CHECK] %s\n", url);
+    
+    if (strstr(response_data, "Server:") || strstr(response_data, "X-Powered-By:")) {
+        printf("[WARN] Server information disclosure detected\n");
+    }
+    
+    if (strstr(response_data, "error") || strstr(response_data, "Error") || 
+        strstr(response_data, "exception") || strstr(response_data, "Exception")) {
+        printf("[WARN] Error information leakage detected\n");
+    }
+    
+    if (strstr(response_data, "root@") || strstr(response_data, "admin@") ||
+        strstr(response_data, "password") || strstr(response_data, "Password")) {
+        printf("[CRITICAL] Sensitive information exposure detected\n");
+    }
+    
+    if (strstr(response_data, "phpinfo()") || strstr(response_data, "PHP Version")) {
+        printf("[CRITICAL] PHP info disclosure detected\n");
+    }
+    
+    if (strstr(response_data, "mysql") || strstr(response_data, "MySQL") ||
+        strstr(response_data, "database") || strstr(response_data, "Database")) {
+        printf("[WARN] Database information leakage detected\n");
+    }
+}
+
+void *load_test_thread(void *arg) {
+    thread_data_t *data = (thread_data_t *)arg;
+    CURL *curl;
+    CURLcode res;
+    struct timeval start_time, end_time;
+    response_data_t response = {0};
+    long response_code;
+    double response_time;
+    
+    curl = curl_easy_init();
+    if (!curl) {
+        printf("[ERROR] Failed to initialize curl for thread %d\n", data->thread_id);
+        return NULL;
+    }
+    
+    curl_easy_setopt(curl, CURLOPT_URL, data->url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, data->connection_timeout);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "LoadTester/1.0");
+    curl_easy_setopt(curl, CURLOPT_HEADER, 1L);
+    
+    time_t start_test = time(NULL);
+    int request_count = 0;
+    
+    printf("[INFO] Thread %d started - Target: %d RPS\n", data->thread_id, data->requests_per_second);
+    
+    while (keep_running && (time(NULL) - start_test) < data->duration) {
+        gettimeofday(&start_time, NULL);
+        
+        response.data = NULL;
+        response.size = 0;
+        
+        res = curl_easy_perform(curl);
+        
+        gettimeofday(&end_time, NULL);
+        response_time = get_time_diff(start_time, end_time);
+        
+        pthread_mutex_lock(data->stats_mutex);
+        
+        data->stats->total_requests++;
+        data->stats->total_response_time += response_time;
+        
+        if (data->stats->min_response_time == 0 || response_time < data->stats->min_response_time) {
+            data->stats->min_response_time = response_time;
+        }
+        if (response_time > data->stats->max_response_time) {
+            data->stats->max_response_time = response_time;
+        }
+        
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+            
+            if (response_code >= 200 && response_code < 400) {
+                data->stats->successful_requests++;
+            } else {
+                data->stats->failed_requests++;
+            }
+            
+            if (response_code < 600) {
+                data->stats->http_codes[response_code]++;
+            }
+            
+            if (request_count == 0 && response.data) {
+                check_vulnerabilities(response.data, data->url);
+            }
+            
+        } else if (res == CURLE_OPERATION_TIMEDOUT) {
+            data->stats->timeout_requests++;
+        } else {
+            data->stats->failed_requests++;
+        }
+        
+        pthread_mutex_unlock(data->stats_mutex);
+        
+        if (response.data) {
+            free(response.data);
+        }
+        
+        request_count++;
+        
+        if (data->requests_per_second > 0) {
+            usleep(1000000 / data->requests_per_second);
+        }
+    }
+    
+    curl_easy_cleanup(curl);
+    printf("[INFO] Thread %d completed %d requests\n", data->thread_id, request_count);
+    
+    return NULL;
+}
+
+void print_results(test_stats_t *stats, int duration, int total_threads) {
+    printf("\n" "=" x50);
+    printf("\n           LOAD TEST RESULTS\n");
+    printf("=" x50 "\n");
+    
+    printf("Test Duration: %d seconds\n", duration);
+    printf("Total Threads: %d\n", total_threads);
+    printf("Total Requests: %ld\n", stats->total_requests);
+    printf("Successful Requests: %ld (%.2f%%)\n", 
+           stats->successful_requests, 
+           (stats->total_requests > 0) ? (stats->successful_requests * 100.0 / stats->total_requests) : 0);
+    printf("Failed Requests: %ld (%.2f%%)\n", 
+           stats->failed_requests,
+           (stats->total_requests > 0) ? (stats->failed_requests * 100.0 / stats->total_requests) : 0);
+    printf("Timeout Requests: %ld (%.2f%%)\n", 
+           stats->timeout_requests,
+           (stats->total_requests > 0) ? (stats->timeout_requests * 100.0 / stats->total_requests) : 0);
+    
+    if (stats->total_requests > 0) {
+        printf("Average Response Time: %.3f seconds\n", stats->total_response_time / stats->total_requests);
+        printf("Min Response Time: %.3f seconds\n", stats->min_response_time);
+        printf("Max Response Time: %.3f seconds\n", stats->max_response_time);
+        printf("Requests Per Second: %.2f\n", stats->total_requests / (double)duration);
+    }
+    
+    printf("\nHTTP Status Codes:\n");
+    for (int i = 0; i < 600; i++) {
+        if (stats->http_codes[i] > 0) {
+            printf("  %d: %d requests\n", i, stats->http_codes[i]);
+        }
+    }
+    
+    printf("\n" "=" x50 "\n");
+    printf("RECOMMENDATIONS:\n");
+    printf("=" x50 "\n");
+    
+    double error_rate = (stats->total_requests > 0) ? 
+                       ((stats->failed_requests + stats->timeout_requests) * 100.0 / stats->total_requests) : 0;
+    
+    if (error_rate > 5.0) {
+        printf("[CRITICAL] High error rate (%.2f%%) - Server overloaded\n", error_rate);
+        printf("  - Increase server resources (CPU/RAM)\n");
+        printf("  - Implement load balancing\n");
+        printf("  - Optimize database queries\n");
+        printf("  - Enable caching mechanisms\n");
+    }
+    
+    if (stats->max_response_time > 5.0) {
+        printf("[WARNING] Slow response times detected (max: %.2fs)\n", stats->max_response_time);
+        printf("  - Optimize application code\n");
+        printf("  - Use CDN for static content\n");
+        printf("  - Implement database indexing\n");
+    }
+    
+    if (stats->timeout_requests > stats->total_requests * 0.1) {
+        printf("[WARNING] High timeout rate - Network/Server issues\n");
+        printf("  - Check network connectivity\n");
+        printf("  - Increase server timeout settings\n");
+        printf("  - Monitor server resource usage\n");
+    }
+    
+    printf("\nSecurity Issues Found:\n");
+    printf("  - Check vulnerability scan output above\n");
+    printf("  - Implement proper error handling\n");
+    printf("  - Hide server version information\n");
+    printf("  - Use HTTPS for sensitive data\n");
+}
+
+void print_usage(const char *program_name) {
+    printf("Usage: %s <URL> [OPTIONS]\n", program_name);
+    printf("Options:\n");
+    printf("  -t <threads>     Number of concurrent threads (default: 10)\n");
+    printf("  -r <rps>         Requests per second per thread (default: 10)\n");
+    printf("  -d <duration>    Test duration in seconds (default: 60)\n");
+    printf("  -T <timeout>     Connection timeout in seconds (default: 30)\n");
+    printf("  -h               Show this help\n");
+    printf("\nExample:\n");
+    printf("  %s http://example.com -t 20 -r 50 -d 120\n", program_name);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    
+    char *url = argv[1];
+    int num_threads = 10;
+    int requests_per_second = 10;
+    int duration = 60;
+    int timeout = 30;
+    
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            num_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+            requests_per_second = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            duration = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {
+            timeout = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
+    
+    printf("Starting load test...\n");
+    printf("Target URL: %s\n", url);
+    printf("Threads: %d\n", num_threads);
+    printf("RPS per thread: %d\n", requests_per_second);
+    printf("Duration: %d seconds\n", duration);
+    printf("Timeout: %d seconds\n", timeout);
+    printf("Total expected RPS: %d\n", num_threads * requests_per_second);
+    
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    thread_data_t *thread_data = malloc(num_threads * sizeof(thread_data_t));
+    
+    memset(&global_stats, 0, sizeof(test_stats_t));
+    
+    for (int i = 0; i < num_threads; i++) {
+        thread_data[i].url = url;
+        thread_data[i].thread_id = i;
+        thread_data[i].requests_per_second = requests_per_second;
+        thread_data[i].duration = duration;
+        thread_data[i].connection_timeout = timeout;
+        thread_data[i].stats = &global_stats;
+        thread_data[i].stats_mutex = &stats_mutex;
+        thread_data[i].running = &keep_running;
+        
+        if (pthread_create(&threads[i], NULL, load_test_thread, &thread_data[i]) != 0) {
+            printf("Error creating thread %d\n", i);
+            return 1;
+        }
+    }
+    
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    print_results(&global_stats, duration, num_threads);
+    
+    free(threads);
+    free(thread_data);
+    curl_global_cleanup();
+    
+    return 0;
+}
