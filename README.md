@@ -15,3 +15,6 @@ sudo apt-get install -y \
     gcc -O3 -o netdub netdub.c -lpthread -lm -lpcap
 
     sudo apt-get update && sudo apt-get install -y libpcap-dev git gcc build-essential linux-headers-$(uname -r) && echo "Installation complete!"
+
+
+gcc -v -o netdub netdub.c -lpthread -lm
